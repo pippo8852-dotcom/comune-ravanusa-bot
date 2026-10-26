@@ -1,0 +1,36 @@
+name: Controlla novità Comune di Ravanusa
+on:
+  schedule:
+    - cron: "0 16 * * 1-5"   # ore 17:00 italiane (ora solare, UTC+1), lun-ven
+  workflow_dispatch:          # avvio manuale
+permissions:
+  contents: write
+concurrency:
+  group: controlla-novita-ravanusa
+  cancel-in-progress: false
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install requests
+      - run: python notify.py
+        env:
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+      - name: Salva stato
+        run: |
+          git config user.name "bot"
+          git config user.email "bot@users.noreply.github.com"
+          git add sent_items.json
+          if ! git diff --cached --quiet; then
+            git commit -m "aggiorna stato"
+            for i in 1 2 3 4 5; do
+              git pull --rebase && git push && break
+              echo "Tentativo $i fallito, riprovo tra 5 secondi..."
+              sleep 5
+            done
+          fi
