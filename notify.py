@@ -9,7 +9,7 @@ import re
 import time
 from datetime import date, datetime
 from pathlib import Path
-from urllib.parse import urljoin
+from urllib.parse import urlencode, urljoin
 
 import requests
 
@@ -28,6 +28,12 @@ HEADERS = {
                    "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"),
     "Accept-Language": "it-IT,it;q=0.9,en;q=0.8",
 }
+
+# Le notizie sono un tipo di contenuto "notizia" (non gli articoli normali): per questo /feed/ è fermo
+# e l'API REST non le espone. La sitemap di WordPress invece le elenca: serve come ripiego se la
+# pagina /novita/ non viene letta. Titolo e data si leggono poi dalla pagina di ogni notizia.
+SITEMAP_URL = f"{SITE_URL}/wp-sitemap-posts-notizia-1.xml"
+ULTIME_DA_SITEMAP = 40       # la sitemap è in ordine di ID crescente: si guardano solo le ultime
 
 GIORNI_MASSIMI = 30          # ignora notizie più vecchie di così
 INVIA_AL_PRIMO_GIRO = True   # True: al primo avvio invia le notizie entro GIORNI_MASSIMI; False: parte in silenzio
@@ -53,6 +59,12 @@ DATA = re.compile(
 # Categoria: link alla categoria della notizia (Avvisi, Notizie, Comunicati...)
 CATEGORIA = re.compile(
     r'<a\b[^>]*href="[^"]*/categoria-notizia/[^"]*"[^>]*>([\s\S]*?)</a>', re.IGNORECASE)
+H1 = re.compile(r'<h1[^>]*>([\s\S]*?)</h1>', re.IGNORECASE)
+# Nella pagina della singola notizia: <small>Data:</small> <p>08 Ottobre 2026</p>
+DATA_ARTICOLO = re.compile(
+    r'Data:\s*</small>\s*<p[^>]*>\s*(\d{1,2})(?:\s|&nbsp;)+([A-Za-zÀ-ú]{3,12})\.?(?:\s|&nbsp;)+(\d{2,4})',
+    re.IGNORECASE)
+LOC = re.compile(r'<loc>\s*([^<\s]+)\s*</loc>', re.IGNORECASE)
 FINESTRA_INTESTAZIONE = 1200   # caratteri prima del titolo in cui cercare data e categoria
 
 
@@ -105,21 +117,81 @@ def estrai_voci(pagina):
     return list(voci.values())
 
 
-def leggi():
+def _get(url, params=None):
+    """GET diretto oppure tramite ScraperAPI (se la chiave c'è)."""
     if SCRAPERAPI_KEY:
-        resp = requests.get(SCRAPERAPI_ENDPOINT, params={"api_key": SCRAPERAPI_KEY, "url": URL}, timeout=60)
-        print(f"📡 Status HTTP Novità Ravanusa (via ScraperAPI): {resp.status_code}")
+        completo = url + ("?" + urlencode(params) if params else "")
+        resp = requests.get(SCRAPERAPI_ENDPOINT, params={"api_key": SCRAPERAPI_KEY, "url": completo}, timeout=60)
+        print(f"📡 Status HTTP {url} (via ScraperAPI): {resp.status_code}")
     else:
-        resp = requests.get(URL, headers=HEADERS, timeout=30)
-        print(f"📡 Status HTTP Novità Ravanusa: {resp.status_code}")
-    resp.raise_for_status()
+        resp = requests.get(url, params=params, headers=HEADERS, timeout=30)
+        print(f"📡 Status HTTP {url}: {resp.status_code}")
+    return resp
 
-    voci = estrai_voci(resp.text)
-    if not voci:
-        # aiuto per capire se il sito ha cambiato struttura
-        punto = resp.text.find("/novita/")
-        brano = resp.text[max(0, punto - 150):punto + 350] if punto >= 0 else resp.text[:300]
-        print(f"🧪 Nessuna notizia riconosciuta. Brano della pagina: {brano!r}")
+
+def leggi_articolo(link):
+    """Legge la pagina di una notizia: (link, titolo, data, categoria) oppure None se non riesce."""
+    try:
+        resp = _get(link)
+        resp.raise_for_status()
+        pagina = resp.text
+    except Exception as e:
+        print(f"⚠️ Notizia non letta ({link}): {e}")
+        return None
+    m = H1.search(pagina)
+    titolo = _testo(m.group(1)) if m else ""
+    if not titolo:
+        print(f"⚠️ Titolo non trovato in {link}")
+        return None
+    d = DATA_ARTICOLO.search(pagina)
+    data = _data_da(f">{d.group(1)} {d.group(2)} {d.group(3)}<") if d else None
+    return (link, titolo, data, None)      # la categoria non è nell'HTML della singola notizia
+
+
+def leggi_sitemap(visti=()):
+    """Ripiego: elenco dalla sitemap, poi si leggono solo le notizie non ancora viste."""
+    try:
+        resp = _get(SITEMAP_URL)
+        resp.raise_for_status()
+    except Exception as e:
+        print(f"ℹ️ Sitemap non disponibile: {e}")
+        return []
+    link = [urljoin(SITE_URL, u) for u in LOC.findall(resp.text)]
+    ultimi = link[-ULTIME_DA_SITEMAP:]
+    nuovi = [u for u in ultimi if u not in set(visti)]
+    print(f"🗺️ Sitemap: {len(link)} notizie, {len(nuovi)} da leggere tra le ultime {len(ultimi)}")
+    voci = []
+    for n, u in enumerate(nuovi):
+        if n > 0:
+            time.sleep(1)
+        v = leggi_articolo(u)
+        if v:
+            voci.append(v)
+    return voci
+
+
+def leggi(visti=()):
+    errore = None
+    voci = []
+    try:
+        resp = _get(URL)
+        resp.raise_for_status()
+        voci = estrai_voci(resp.text)
+        if not voci:
+            # aiuto per capire se il sito ha cambiato struttura
+            punto = resp.text.find("/novita/")
+            brano = resp.text[max(0, punto - 150):punto + 350] if punto >= 0 else resp.text[:300]
+            print(f"🧪 Nessuna notizia riconosciuta. Brano della pagina: {brano!r}")
+    except Exception as e:
+        errore = e
+        print(f"⚠️ Pagina Novità non letta: {e}")
+    if voci:
+        return voci
+
+    print("↪️ Provo con la sitemap")
+    voci = leggi_sitemap(visti)
+    if not voci and errore:
+        raise errore
     return voci
 
 
@@ -186,18 +258,18 @@ def main():
     stato = carica_stato()
     adesso = oggi()
 
+    visti = set(stato.get(NOME_FONTE, {}).get("visti", []))
     try:
-        voci = leggi()
+        voci = leggi(visti)
     except Exception as e:
         print(f"[{NOME_FONTE}] errore: {e}")
         salva_stato(stato)
         return
     if not voci:
-        print(f"[{NOME_FONTE}] nessun elemento letto: controlla se il layout è cambiato")
+        print(f"[{NOME_FONTE}] nessun elemento nuovo o leggibile (se succede sempre, controlla se il layout è cambiato)")
         salva_stato(stato)
         return
 
-    visti = set(stato.get(NOME_FONTE, {}).get("visti", []))
     primo_giro = NOME_FONTE not in stato
     nuove = [v for v in voci if v[0] not in visti]
     recenti = [v for v in nuove if v[2] is None or (adesso - v[2]).days <= GIORNI_MASSIMI]
