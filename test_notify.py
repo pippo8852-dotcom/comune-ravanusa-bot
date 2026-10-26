@@ -1,397 +1,443 @@
-"""Test per notify.py (bot Novità Comune di Ravanusa).
-Non fanno nessuna richiesta reale a internet o a Telegram: usano dati finti o il vero
-feed scaricato in precedenza (feed_reale_di_prova.xml), salvato come fotografia di
-riferimento."""
+"""Test per notify.py (bot Novità Comune di Ravanusa, stile UST Milano).
+Non fanno nessuna richiesta reale a internet o a Telegram: simulano (mock) le risposte
+per verificare che la logica dello script sia corretta."""
 import json
 import os
+import re
+import shutil
+import tempfile
 import unittest
-from unittest import mock
+from datetime import date, timedelta
+from pathlib import Path
+from unittest.mock import MagicMock, patch
 
 os.environ.setdefault("TELEGRAM_TOKEN", "test-token")
 os.environ.setdefault("TELEGRAM_CHAT_ID", "test-chat")
 
-import notify
+import notify as nt
+
+MESI_ABBR = {v: k.upper() for k, v in nt.MESI.items()}
+SITO = "https://www.comune.ravanusa.ag.it"
 
 
-def make_response(status, content, is_json=False):
-    resp = mock.MagicMock()
-    resp.status_code = status
-    if is_json:
-        resp.json.return_value = content
-    else:
-        resp.content = content.encode("utf-8") if isinstance(content, str) else content
-        resp.text = content if isinstance(content, str) else content.decode("utf-8")
+def scheda(slug, titolo, data="08 OTT 26", categoria="Avvisi", assoluto=True):
+    """Una scheda della pagina Novità, con la struttura vista sul sito:
+    categoria e data in alto, poi il titolo come link dentro un h3."""
+    href = f"{SITO}/novita/{slug}/" if assoluto else f"/novita/{slug}/"
+    intestazione = ""
+    if categoria:
+        intestazione += (f'<a class="category" href="{SITO}/categoria-notizia/{categoria.lower()}/">'
+                         f'{categoria.upper()}</a>')
+    if data:
+        intestazione += f'<span class="data">{data}</span>'
+    return f'''
+    <div class="card card-article">
+      <div class="card-body">
+        <div class="category-top">{intestazione}</div>
+        <h3 class="card-title h5"><a class="text-decoration-none" href="{href}">
+            {titolo}
+        </a></h3>
+        <p class="card-text">Descrizione della notizia del 1° al 31 ottobre 2026.</p>
+      </div>
+    </div>'''
+
+
+def pagina(*schede, prima=""):
+    return ("<html><body><nav><a href='/novita/'>Novità</a><a href='/servizi/'>Servizi</a></nav>"
+            + prima + "".join(schede) + "<footer>Comune di Ravanusa</footer></body></html>")
+
+
+def formato_sito(giorni_fa):
+    """Data come la scrive il sito (es. '08 OTT 26') per una notizia di N giorni fa."""
+    d = nt.oggi() - timedelta(days=giorni_fa)
+    return f"{d.day:02d} {MESI_ABBR[d.month]} {str(d.year)[2:]}"
+
+
+def risposta(testo, status=200):
+    r = MagicMock(status_code=status, text=testo)
     if status >= 400:
-        resp.raise_for_status.side_effect = Exception(f"HTTP {status}")
+        r.raise_for_status.side_effect = Exception(f"HTTP {status}")
     else:
-        resp.raise_for_status = lambda: None
-    return resp
+        r.raise_for_status = lambda: None
+    return r
 
 
-RSS_SAMPLE = """<?xml version="1.0" encoding="UTF-8"?>
-<rss version="2.0">
-<channel>
-<title>Comune di Ravanusa</title>
-<item>
-    <title>Avviso pubblico &#8217; prova</title>
-    <link>https://www.comune.ravanusa.ag.it/novita/avviso-prova/</link>
-    <pubDate>Tue, 11 Nov 2025 15:19:20 +0000</pubDate>
-    <category><![CDATA[Avvisi]]></category>
-    <guid isPermaLink="false">https://www.comune.ravanusa.ag.it/?p=5510</guid>
-</item>
-<item>
-    <title>Seconda notizia di prova</title>
-    <link>https://www.comune.ravanusa.ag.it/novita/seconda-notizia/</link>
-    <pubDate>Mon, 10 Nov 2025 09:00:00 +0000</pubDate>
-    <category><![CDATA[Notizie]]></category>
-    <guid isPermaLink="false">https://www.comune.ravanusa.ag.it/?p=5500</guid>
-</item>
-</channel>
-</rss>"""
+class TestEstrazione(unittest.TestCase):
+    def test_estrae_una_notizia(self):
+        voci = nt.estrai_voci(pagina(scheda("refezione", "Iscrizione refezione")))
+        self.assertEqual(len(voci), 1)
+        link, titolo, data, categoria = voci[0]
+        self.assertEqual(link, f"{SITO}/novita/refezione/")
+        self.assertEqual(titolo, "Iscrizione refezione")
+        self.assertEqual(data, date(2026, 10, 8))
+        self.assertEqual(categoria, "AVVISI")
+
+    def test_piu_notizie_nell_ordine_della_pagina(self):
+        voci = nt.estrai_voci(pagina(scheda("a", "Prima", "26 OTT 2026"),
+                                     scheda("b", "Seconda", "08 OTT 26"),
+                                     scheda("c", "Terza", "06 OTT 26")))
+        self.assertEqual([v[1] for v in voci], ["Prima", "Seconda", "Terza"])
+        self.assertEqual([v[2] for v in voci],
+                         [date(2026, 10, 26), date(2026, 10, 8), date(2026, 10, 6)])
+
+    def test_anno_a_due_e_a_quattro_cifre(self):
+        voci = nt.estrai_voci(pagina(scheda("a", "A", "26 OTT 2026"), scheda("b", "B", "26 OTT 26")))
+        self.assertEqual(voci[0][2], voci[1][2])
+
+    def test_tutti_i_mesi_abbreviati(self):
+        for abbr, numero in nt.MESI.items():
+            voci = nt.estrai_voci(pagina(scheda("x", "Titolo", f"05 {abbr.upper()} 26")))
+            self.assertEqual(voci[0][2], date(2026, numero, 5), abbr)
+
+    def test_data_con_spazio_non_separabile(self):
+        voci = nt.estrai_voci(pagina(scheda("x", "T", "08&nbsp;OTT&nbsp;26")))
+        self.assertEqual(voci[0][2], date(2026, 10, 8))
+
+    def test_notizia_senza_categoria(self):
+        voci = nt.estrai_voci(pagina(scheda("x", "Titolo", categoria=None)))
+        self.assertIsNone(voci[0][3])
+        self.assertEqual(voci[0][2], date(2026, 10, 8))
+
+    def test_notizia_senza_data(self):
+        voci = nt.estrai_voci(pagina(scheda("x", "Titolo", data=None)))
+        self.assertEqual(len(voci), 1)
+        self.assertIsNone(voci[0][2])
+
+    def test_data_e_categoria_sono_quelle_della_propria_scheda(self):
+        # la seconda scheda non ha data né categoria: non deve "rubare" quelle della prima
+        voci = nt.estrai_voci(pagina(scheda("a", "Con dati", "08 OTT 26", "Avvisi"),
+                                     scheda("b", "Senza dati", None, None)))
+        self.assertEqual(voci[0][2], date(2026, 10, 8))
+        self.assertIsNone(voci[1][2])
+        self.assertIsNone(voci[1][3])
+
+    def test_mese_sconosciuto_non_da_una_data(self):
+        voci = nt.estrai_voci(pagina(scheda("x", "Titolo", "08 XYZ 26")))
+        self.assertIsNone(voci[0][2])
+
+    def test_data_impossibile_non_da_una_data(self):
+        voci = nt.estrai_voci(pagina(scheda("x", "Titolo", "31 FEB 26")))
+        self.assertIsNone(voci[0][2])
+
+    def test_titolo_con_spazi_a_capo_e_codici_html(self):
+        voci = nt.estrai_voci(pagina(scheda("x", "  AVVISO\n   PUBBLICO &amp; L&#8217;albo  ")))
+        self.assertEqual(voci[0][1], "AVVISO PUBBLICO & L’albo")
+
+    def test_titolo_con_tag_interni(self):
+        voci = nt.estrai_voci(pagina(scheda("x", "Titolo <span>con</span> <b>tag</b>")))
+        self.assertEqual(voci[0][1], "Titolo con tag")
+
+    def test_link_relativo_diventa_assoluto(self):
+        voci = nt.estrai_voci(pagina(scheda("x", "Titolo", assoluto=False)))
+        self.assertEqual(voci[0][0], f"{SITO}/novita/x/")
+
+    def test_notizie_in_evidenza_ripetute_non_duplicano(self):
+        voci = nt.estrai_voci(pagina(scheda("a", "Prima", "08 OTT 26"),
+                                     scheda("b", "Altra", "06 OTT 26"),
+                                     scheda("a", "Prima", "26 FEB 26")))
+        self.assertEqual([v[0].rsplit("/", 2)[1] for v in voci], ["a", "b"])
+        self.assertEqual(voci[0][2], date(2026, 10, 8))     # vale la prima occorrenza
+
+    def test_link_di_menu_e_altre_sezioni_sono_ignorati(self):
+        altro = (f'<h3><a href="{SITO}/servizio/trasporto/">Servizio</a></h3>'
+                 f'<h3><a href="{SITO}/novita/">Tutte le novità</a></h3>'
+                 f'<p><a href="{SITO}/novita/solo-link-nel-testo/">non è un titolo</a></p>')
+        voci = nt.estrai_voci(pagina(scheda("a", "Vera notizia"), prima=altro))
+        self.assertEqual([v[1] for v in voci], ["Vera notizia"])
+
+    def test_pagina_senza_notizie(self):
+        self.assertEqual(nt.estrai_voci("<html><body>vuota</body></html>"), [])
+        self.assertEqual(nt.estrai_voci(""), [])
+
+    def test_titolo_vuoto_e_ignorato(self):
+        self.assertEqual(nt.estrai_voci(pagina(scheda("x", "   "))), [])
+
+    def test_data_nella_descrizione_non_viene_scambiata_per_quella_della_notizia(self):
+        # la descrizione della prima scheda contiene "31 ottobre 2026": la seconda scheda,
+        # senza data, non deve prenderla
+        voci = nt.estrai_voci(pagina(scheda("a", "Prima", "08 OTT 26"),
+                                     scheda("b", "Seconda", None, None)))
+        self.assertIsNone(voci[1][2])
 
 
-class FetchNovitaTests(unittest.TestCase):
-    def fetch(self, content, status=200):
-        with mock.patch("notify.requests.get", return_value=make_response(status, content)):
-            return notify.fetch_novita()
+    def test_varianti_di_scrittura_della_data(self):
+        varianti = [
+            '<div><a href="/categoria-notizia/avvisi/">AVVISI</a> 08 OTT 26</div>',
+            '<div><span>AVVISI</span> — <span>08 OTT 26</span></div>',
+            '<div><span>AVVISI — 08 OTT 26</span></div>',
+            '<div><time datetime="2026-10-08">08 OTT 26</time></div>',
+            '<div>AVVISI 08 OTT 26</div>',
+        ]
+        for variante in varianti:
+            html_pagina = (f'<html><body>{variante}<h3><a href="{SITO}/novita/x/">Titolo</a></h3>'
+                           '</body></html>')
+            voci = nt.estrai_voci(html_pagina)
+            self.assertEqual(voci[0][2], date(2026, 10, 8), variante)
 
-    def test_legge_due_notizie_dal_feed(self):
-        items = self.fetch(RSS_SAMPLE)
-        self.assertEqual(len(items), 2)
+    def test_titolo_senza_heading_non_e_una_notizia(self):
+        html_pagina = f'<html><body><div class="titolo"><a href="{SITO}/novita/x/">Titolo</a></div></body></html>'
+        self.assertEqual(nt.estrai_voci(html_pagina), [])
 
-    def test_titolo_pulito_e_senza_codici_html(self):
-        items = self.fetch(RSS_SAMPLE)
-        # &#8217; deve diventare un apostrofo vero, non restare come codice
-        self.assertIn("’", items[0]["title"])
-        self.assertNotIn("&#8217;", items[0]["title"])
-
-    def test_link_e_id_corretti(self):
-        items = self.fetch(RSS_SAMPLE)
-        self.assertEqual(items[0]["link"],
-                         "https://www.comune.ravanusa.ag.it/novita/avviso-prova/")
-        self.assertEqual(items[0]["id"],
-                         "https://www.comune.ravanusa.ag.it/?p=5510")
-
-    def test_categoria_estratta_come_subject(self):
-        items = self.fetch(RSS_SAMPLE)
-        self.assertEqual(items[0]["subject"], "Avvisi")
-        self.assertEqual(items[1]["subject"], "Notizie")
-
-    def test_data_convertita_in_formato_italiano(self):
-        items = self.fetch(RSS_SAMPLE)
-        # 15:19 UTC del 11 novembre diventa 16:19 ora italiana (CET, UTC+1 a novembre)
-        self.assertIn("11/11/2025", items[0]["date"])
-
-    def test_feed_vuoto_restituisce_lista_vuota(self):
-        vuoto = """<?xml version="1.0"?><rss version="2.0"><channel></channel></rss>"""
-        self.assertEqual(self.fetch(vuoto), [])
-
-    def test_errore_http_passa_al_tentativo_successivo(self):
-        # Il primo indirizzo (feed/) fallisce per 2 volte (FEED_ATTEMPTS=2):
-        # deve passare all'API WordPress, che invece risponde subito bene.
-        wp_posts = [{"id": 1, "link": "https://www.comune.ravanusa.ag.it/novita/x/",
-                     "title": {"rendered": "Notizia dall'API"}, "date_gmt": "2026-01-01T10:00:00"}]
-        risposte = [make_response(403, ""), make_response(403, ""),
-                    make_response(200, wp_posts, is_json=True)]
-        with mock.patch("notify.requests.get", side_effect=risposte), \
-             mock.patch("notify.time.sleep"):
-            items = notify.fetch_novita()
-        self.assertEqual(len(items), 1)
-        self.assertEqual(items[0]["title"], "Notizia dall'API")
+    def test_testo_lungo_con_data_non_conta_come_data_della_scheda(self):
+        html_pagina = (f'<html><body><p>Scadenza della presentazione delle domande entro il 31 ottobre 2026 '
+                       f'presso gli uffici</p><h3><a href="{SITO}/novita/x/">Titolo</a></h3></body></html>')
+        self.assertIsNone(nt.estrai_voci(html_pagina)[0][2])
 
 
-class FetchNovitaConFeedReale(unittest.TestCase):
-    """Verifica il parser contro una copia reale del feed, scaricata il 25/10/2026."""
+class TestLettura(unittest.TestCase):
+    def test_lettura_diretta_senza_scraperapi(self):
+        with patch.object(nt, "SCRAPERAPI_KEY", None), \
+             patch("notify.requests.get", return_value=risposta(pagina(scheda("a", "A")))) as get:
+            voci = nt.leggi()
+        self.assertEqual(len(voci), 1)
+        self.assertEqual(get.call_args.args[0], f"{SITO}/novita/")
+        self.assertIn("User-Agent", get.call_args.kwargs["headers"])
 
-    @classmethod
-    def setUpClass(cls):
-        percorso = os.path.join(os.path.dirname(__file__), "feed_reale_di_prova.xml")
-        with open(percorso, "r", encoding="utf-8") as f:
-            cls.contenuto_feed = f.read()
+    def test_lettura_con_scraperapi_se_la_chiave_c_e(self):
+        with patch.object(nt, "SCRAPERAPI_KEY", "chiave"), \
+             patch("notify.requests.get", return_value=risposta(pagina(scheda("a", "A")))) as get:
+            nt.leggi()
+        self.assertEqual(get.call_args.args[0], nt.SCRAPERAPI_ENDPOINT)
+        self.assertEqual(get.call_args.kwargs["params"]["url"], nt.URL)
+        self.assertEqual(get.call_args.kwargs["params"]["api_key"], "chiave")
 
-    def test_legge_tutte_le_notizie_del_feed_reale(self):
-        with mock.patch("notify.requests.get",
-                        return_value=make_response(200, self.contenuto_feed)):
-            items = notify.fetch_novita()
-        # il feed scaricato conteneva 10 <item>
-        self.assertEqual(len(items), 10)
+    def test_errore_http_si_propaga(self):
+        with patch.object(nt, "SCRAPERAPI_KEY", None), \
+             patch("notify.requests.get", return_value=risposta("", status=503)):
+            with self.assertRaises(Exception):
+                nt.leggi()
 
-    def test_ogni_notizia_ha_titolo_link_e_id(self):
-        with mock.patch("notify.requests.get",
-                        return_value=make_response(200, self.contenuto_feed)):
-            items = notify.fetch_novita()
-        for item in items:
-            self.assertTrue(item["title"])
-            self.assertTrue(item["link"].startswith("https://www.comune.ravanusa.ag.it"))
-            self.assertTrue(item["id"])
-
-    def test_nessun_codice_html_residuo_nei_titoli(self):
-        with mock.patch("notify.requests.get",
-                        return_value=make_response(200, self.contenuto_feed)):
-            items = notify.fetch_novita()
-        for item in items:
-            self.assertNotIn("&#8217;", item["title"])
-            self.assertNotIn("&amp;", item["title"])
+    def test_pagina_senza_notizie_stampa_un_brano_per_la_diagnosi(self):
+        with patch.object(nt, "SCRAPERAPI_KEY", None), \
+             patch("notify.requests.get", return_value=risposta("<html>layout nuovo</html>")), \
+             patch("builtins.print") as stampa:
+            voci = nt.leggi()
+        self.assertEqual(voci, [])
+        self.assertTrue(any("Nessuna notizia riconosciuta" in str(c.args[0]) for c in stampa.call_args_list))
 
 
-RSS_NOVITA = """<?xml version="1.0" encoding="UTF-8"?>
-<rss version="2.0"><channel><title>Novità</title>
-<item>
-    <title>Iscrizione refezione scolastica</title>
-    <link>https://www.comune.ravanusa.ag.it/novita/iscrizione-refezione/</link>
-    <pubDate>Thu, 08 Oct 2026 08:00:00 +0000</pubDate>
-    <category><![CDATA[Avvisi]]></category>
-    <guid isPermaLink="false">https://www.comune.ravanusa.ag.it/?post_type=novita&amp;p=5701</guid>
-</item>
-<item>
-    <title>Albo presidenti di seggio</title>
-    <link>https://www.comune.ravanusa.ag.it/novita/albo-presidenti-seggio/</link>
-    <pubDate>Tue, 06 Oct 2026 08:00:00 +0000</pubDate>
-    <category><![CDATA[Avvisi]]></category>
-    <guid isPermaLink="false">https://www.comune.ravanusa.ag.it/?post_type=novita&amp;p=5698</guid>
-</item>
-<item>
-    <title>Pagina di servizio (non è una novità)</title>
-    <link>https://www.comune.ravanusa.ag.it/servizio/trasporto-scolastico/</link>
-    <pubDate>Mon, 05 Oct 2026 08:00:00 +0000</pubDate>
-    <guid isPermaLink="false">https://www.comune.ravanusa.ag.it/?p=5600</guid>
-</item>
-</channel></rss>"""
+class TestFormatoMessaggio(unittest.TestCase):
+    def test_struttura_del_messaggio(self):
+        testo = nt.formatta_messaggio("Titolo di prova", date(2026, 10, 8),
+                                      f"{SITO}/novita/x/", "AVVISI")
+        righe = testo.split("\n")
+        self.assertEqual(righe[0], f"{nt.NOME_FONTE} - AVVISI")
+        self.assertEqual(righe[1], "Titolo di prova")
+        self.assertEqual(righe[2], "📅 08/10/2026")
+        self.assertEqual(righe[3], f'<a href="{SITO}/novita/x/">🔗 Leggi la notizia</a>')
+        self.assertEqual(len(righe), 4)
 
-TIPI_JSON = {
-    "post": {"slug": "post", "rest_base": "posts"},
-    "page": {"slug": "page", "rest_base": "pages"},
-    "attachment": {"slug": "attachment", "rest_base": "media"},
-    "wp_block": {"slug": "wp_block", "rest_base": "blocks"},
-    "notizia": {"slug": "notizia", "rest_base": "notizie"},
-    "servizio": {"slug": "servizio", "rest_base": "servizi"},
-}
+    def test_senza_categoria_e_senza_data(self):
+        testo = nt.formatta_messaggio("Titolo", None, f"{SITO}/novita/x/")
+        self.assertEqual(testo.split("\n")[0], nt.NOME_FONTE)
+        self.assertNotIn("📅", testo)
+        self.assertEqual(len(testo.split("\n")), 3)
 
+    def test_il_link_e_nella_scritta_e_non_scritto_per_esteso(self):
+        testo = nt.formatta_messaggio("Titolo", date(2026, 10, 8), f"{SITO}/novita/x/")
+        self.assertEqual(re.findall(r">([^<]*)</a>", testo), ["🔗 Leggi la notizia"])
+        self.assertEqual(testo.count(f"{SITO}/novita/x/"), 1)
+        self.assertNotIn("\nhttps://", testo)
 
-def voce_rest(numero, giorno, link_sezione="novita"):
-    return {"id": numero, "link": f"https://www.comune.ravanusa.ag.it/{link_sezione}/voce-{numero}/",
-            "title": {"rendered": f"Voce {numero}"}, "date_gmt": f"2026-10-{giorno:02d}T08:00:00"}
+    def test_caratteri_speciali_sono_escapati(self):
+        testo = nt.formatta_messaggio("Orari <classi> A&B", date(2026, 10, 8),
+                                      f'{SITO}/novita/x/?a=1&b="2"', "Avvisi & co")
+        self.assertIn("Orari &lt;classi&gt; A&amp;B", testo)
+        self.assertIn("Avvisi &amp; co", testo)
+        self.assertIn('href="https://www.comune.ravanusa.ag.it/novita/x/?a=1&amp;b=&quot;2&quot;"', testo)
+
+    def test_nessun_orario_nel_messaggio(self):
+        # il sito pubblica solo la data: il messaggio non deve inventare un'ora
+        testo = nt.formatta_messaggio("Titolo", date(2026, 10, 8), f"{SITO}/novita/x/")
+        self.assertNotRegex(testo, r"\d{1,2}:\d{2}")
 
 
-class FetchSezioneNovitaTests(unittest.TestCase):
+class TestInvio(unittest.TestCase):
     def setUp(self):
-        patcher = mock.patch("notify.time.sleep")
-        patcher.start()
-        self.addCleanup(patcher.stop)
-
-    def fetch(self, risposte):
-        with mock.patch("notify.requests.get", side_effect=risposte) as get:
-            items = notify.fetch_novita_sezione()
-        return items, get
-
-    def test_legge_il_feed_della_sezione_novita(self):
-        items, get = self.fetch([make_response(200, RSS_NOVITA)])
-        self.assertEqual(get.call_args_list[0].args[0],
-                         "https://www.comune.ravanusa.ag.it/novita/feed/")
-        self.assertEqual([i["title"] for i in items],
-                         ["Iscrizione refezione scolastica", "Albo presidenti di seggio"])
-
-    def test_l_id_e_il_link_della_notizia(self):
-        items, _ = self.fetch([make_response(200, RSS_NOVITA)])
-        self.assertEqual(items[0]["id"],
-                         "https://www.comune.ravanusa.ag.it/novita/iscrizione-refezione/")
-
-    def test_le_voci_fuori_dalla_sezione_novita_sono_scartate(self):
-        items, _ = self.fetch([make_response(200, RSS_NOVITA)])
-        self.assertTrue(all("/novita/" in i["link"] for i in items))
-        self.assertEqual(len(items), 2)
-
-    def test_data_e_categoria_restano_disponibili(self):
-        items, _ = self.fetch([make_response(200, RSS_NOVITA)])
-        self.assertEqual(items[0]["date"], "08/10/2026 10:00")   # 08:00 UTC = 10:00 ora legale
-        self.assertEqual(items[0]["subject"], "Avvisi")
-
-    def test_se_il_feed_fallisce_cerca_nell_api(self):
-        risposte = [make_response(404, ""), make_response(404, ""),
-                    make_response(200, TIPI_JSON, is_json=True),
-                    make_response(200, [voce_rest(7, 8), voce_rest(6, 2)], is_json=True),
-                    make_response(200, [voce_rest(9, 3, link_sezione="servizio")], is_json=True)]
-        items, get = self.fetch(risposte)
-        self.assertEqual([i["id"] for i in items],
-                         ["https://www.comune.ravanusa.ag.it/novita/voce-7/",
-                          "https://www.comune.ravanusa.ag.it/novita/voce-6/"])
-
-    def test_l_api_interroga_solo_i_tipi_personalizzati(self):
-        risposte = [make_response(404, ""), make_response(404, ""),
-                    make_response(200, TIPI_JSON, is_json=True),
-                    make_response(200, [], is_json=True), make_response(200, [], is_json=True)]
-        _, get = self.fetch(risposte)
-        urls = [c.args[0] for c in get.call_args_list]
-        self.assertTrue(any("/wp/v2/notizie?" in u for u in urls))
-        self.assertTrue(any("/wp/v2/servizi?" in u for u in urls))
-        for standard in ("/wp/v2/posts", "/wp/v2/pages", "/wp/v2/media", "/wp/v2/blocks"):
-            self.assertFalse(any(standard in u for u in urls), standard)
-
-    def test_api_ordina_dal_piu_recente(self):
-        risposte = [make_response(404, ""), make_response(404, ""),
-                    make_response(200, {"a": {"slug": "a", "rest_base": "a"},
-                                        "b": {"slug": "b", "rest_base": "b"}}, is_json=True),
-                    make_response(200, [voce_rest(1, 2)], is_json=True),
-                    make_response(200, [voce_rest(2, 9)], is_json=True)]
-        items, _ = self.fetch(risposte)
-        self.assertEqual([i["title"] for i in items], ["Voce 2", "Voce 1"])
-
-    def test_feed_senza_voci_novita_passa_all_api(self):
-        senza_novita = RSS_NOVITA.replace("/novita/", "/altro/")
-        risposte = [make_response(200, senza_novita),
-                    make_response(200, TIPI_JSON, is_json=True),
-                    make_response(200, [voce_rest(7, 8)], is_json=True),
-                    make_response(200, [], is_json=True)]
-        items, _ = self.fetch(risposte)
-        self.assertEqual([i["title"] for i in items], ["Voce 7"])
-
-    def test_tutto_irraggiungibile_restituisce_lista_vuota(self):
-        with mock.patch("notify.requests.get", return_value=make_response(503, "")):
-            self.assertEqual(notify.fetch_novita_sezione(), [])
-
-    def test_api_con_risposta_inattesa_restituisce_lista_vuota(self):
-        risposte = [make_response(404, ""), make_response(404, ""),
-                    make_response(200, ["non", "un", "dizionario"], is_json=True),
-                    make_response(200, ["non", "un", "dizionario"], is_json=True)]
-        items, _ = self.fetch(risposte)
-        self.assertEqual(items, [])
-
-
-class SezioneNovitaInSourcesTests(unittest.TestCase):
-    def setUp(self):
-        self.src = next(s for s in notify.SOURCES if s["key"] == "novita_ravanusa")
-        patcher = mock.patch("notify.time.sleep")
-        patcher.start()
-        self.addCleanup(patcher.stop)
+        for nome, valore in (("TOKEN", "tok"), ("CHAT_ID", "123")):
+            p = patch.object(nt, nome, valore)
+            p.start()
+            self.addCleanup(p.stop)
+        s = patch("notify.time.sleep")
+        self.sleep = s.start()
+        self.addCleanup(s.stop)
 
     @staticmethod
-    def giorni_fa(n):
-        from datetime import datetime, timedelta
-        return (datetime.now() - timedelta(days=n)).strftime("%d/%m/%Y %H:%M")
+    def ok():
+        r = MagicMock(status_code=200)
+        r.raise_for_status = lambda: None
+        return r
 
-    def item(self, n, data):
-        return {"id": f"https://esempio/novita/{n}/", "title": f"Notizia {n}",
-                "link": f"https://esempio/novita/{n}/", "date": data, "subject": None}
+    @staticmethod
+    def troppe(retry_after=2):
+        r = MagicMock(status_code=429)
+        r.json.return_value = {"parameters": {"retry_after": retry_after}}
+        r.raise_for_status.side_effect = Exception("429 Too Many Requests")
+        return r
 
-    def test_la_sezione_e_attiva_e_ha_un_limite_di_eta(self):
-        self.assertTrue(self.src["enabled"])
-        self.assertEqual(self.src["max_age_days"], 60)
+    def test_parametri_della_richiesta(self):
+        with patch("notify.requests.post", return_value=self.ok()) as post:
+            self.assertTrue(nt.invia("messaggio"))
+        dati = post.call_args.kwargs["data"]
+        self.assertIn("bottok/sendMessage", post.call_args.args[0])
+        self.assertEqual(dati["chat_id"], "123")
+        self.assertEqual(dati["text"], "messaggio")
+        self.assertEqual(dati["parse_mode"], "HTML")
+        self.assertEqual(dati["disable_web_page_preview"], "true")
 
-    def test_la_fonte_precedente_resta_la_prima(self):
-        self.assertEqual(notify.SOURCES[0]["key"], "feed_ravanusa")
-
-    def test_notizie_troppo_vecchie_non_vengono_inviate_ne_salvate(self):
-        state = {}
-        items = [self.item(2, self.giorni_fa(1)), self.item(1, self.giorni_fa(120))]
-        with mock.patch.dict(self.src, {"fetch": lambda: items}), \
-             mock.patch("notify.send_telegram_message", return_value=True) as send:
-            notify.process_source(state, self.src)
-        self.assertEqual(send.call_count, 1)
-        self.assertIn("Notizia 2", send.call_args.args[0])
-        self.assertEqual(state["novita_ravanusa"], ["https://esempio/novita/2/"])
-
-    def test_notizia_al_limite_di_eta_viene_inviata(self):
-        state = {}
-        with mock.patch.dict(self.src, {"fetch": lambda: [self.item(1, self.giorni_fa(59))]}), \
-             mock.patch("notify.send_telegram_message", return_value=True) as send:
-            notify.process_source(state, self.src)
-        send.assert_called_once()
-
-    def test_notizia_senza_data_viene_inviata(self):
-        state = {}
-        with mock.patch.dict(self.src, {"fetch": lambda: [self.item(1, None)]}), \
-             mock.patch("notify.send_telegram_message", return_value=True) as send:
-            notify.process_source(state, self.src)
-        send.assert_called_once()
-
-    def test_la_fonte_senza_limite_di_eta_invia_anche_le_vecchie(self):
-        # la fonte del feed principale non ha max_age_days: comportamento invariato
-        vecchia = next(s for s in notify.SOURCES if s["key"] == "feed_ravanusa")
-        state = {}
-        with mock.patch.dict(vecchia, {"fetch": lambda: [self.item(1, self.giorni_fa(400))]}), \
-             mock.patch("notify.send_telegram_message", return_value=True) as send:
-            notify.process_source(state, vecchia)
-        send.assert_called_once()
-
-    def test_messaggio_con_etichetta_notizie_e_data(self):
-        state = {}
-        with mock.patch.dict(self.src, {"fetch": lambda: [self.item(1, self.giorni_fa(1))]}), \
-             mock.patch("notify.send_telegram_message", return_value=True) as send:
-            notify.process_source(state, self.src)
-        msg = send.call_args.args[0]
-        self.assertIn("Novità Comune di Ravanusa", msg)
-        self.assertIn("Leggi la notizia</a>", msg)
-        self.assertIn("🗓", msg)
-
-
-class ProcessSourceTests(unittest.TestCase):
-    def setUp(self):
-        self._tmp = os.path.join(os.path.dirname(__file__), "_tmp_test_state")
-        os.makedirs(self._tmp, exist_ok=True)
-        self._cwd = os.getcwd()
-        os.chdir(self._tmp)
-        notify.STATE_FILE = "sent_items.json"
-
-    def tearDown(self):
-        os.chdir(self._cwd)
-        import shutil
-        shutil.rmtree(self._tmp, ignore_errors=True)
-
-    def item(self, n):
-        return {"id": f"id{n}", "title": f"Notizia {n}",
-                "link": f"https://esempio/{n}", "date": "01/01/2026 10:00",
-                "subject": "Avvisi"}
-
-    def test_primo_giro_invia_tutte_le_notizie_lette(self):
-        state = {}
-        with mock.patch.dict(notify.SOURCES[0], {"fetch": lambda: [self.item(1)]}), \
-             mock.patch("notify.send_telegram_message", return_value=True) as send, \
-             mock.patch("notify.time.sleep"):
-            notify.process_source(state, notify.SOURCES[0])
-        send.assert_called_once()
-        self.assertEqual(state["feed_ravanusa"], ["id1"])
-
-    def test_notizia_gia_vista_non_viene_reinviata(self):
-        state = {"feed_ravanusa": ["id1"]}
-        with mock.patch.dict(notify.SOURCES[0], {"fetch": lambda: [self.item(1)]}), \
-             mock.patch("notify.send_telegram_message") as send:
-            notify.process_source(state, notify.SOURCES[0])
-        send.assert_not_called()
-
-    def test_ordine_di_invio_dalla_piu_vecchia_alla_piu_recente(self):
-        state = {}
-        ordine_inviato = []
-        with mock.patch.dict(notify.SOURCES[0], {"fetch": lambda: [self.item(2), self.item(1)]}), \
-             mock.patch("notify.send_telegram_message",
-                        side_effect=lambda msg: (ordine_inviato.append(msg), True)[1]), \
-             mock.patch("notify.time.sleep"):
-            notify.process_source(state, notify.SOURCES[0])
-        self.assertIn("Notizia 1", ordine_inviato[0])
-        self.assertIn("Notizia 2", ordine_inviato[1])
-
-    def test_invio_fallito_non_salva_lo_stato_e_si_ferma(self):
-        state = {}
-        with mock.patch.dict(notify.SOURCES[0], {"fetch": lambda: [self.item(2), self.item(1)]}), \
-             mock.patch("notify.send_telegram_message", return_value=False), \
-             mock.patch("notify.time.sleep"):
-            notify.process_source(state, notify.SOURCES[0])
-        self.assertEqual(state["feed_ravanusa"], [])
-
-
-class SendTelegramTests(unittest.TestCase):
-    def test_senza_token_non_invia_nulla(self):
-        with mock.patch.object(notify, "TELEGRAM_TOKEN", None):
-            self.assertFalse(notify.send_telegram_message("prova"))
+    def test_senza_token_non_invia(self):
+        with patch.object(nt, "TOKEN", None), patch("notify.requests.post") as post:
+            self.assertFalse(nt.invia("messaggio"))
+        post.assert_not_called()
 
     def test_riprova_dopo_429_e_poi_riesce(self):
-        risposta_429 = make_response(429, "")
-        risposta_429.json.return_value = {"parameters": {"retry_after": 0}}
-        risposta_ok = make_response(200, "")
-        with mock.patch("notify.requests.post", side_effect=[risposta_429, risposta_ok]) as post, \
-             mock.patch("notify.time.sleep"):
-            ok = notify.send_telegram_message("prova")
-        self.assertTrue(ok)
+        with patch("notify.requests.post", side_effect=[self.troppe(2), self.ok()]) as post:
+            self.assertTrue(nt.invia("messaggio"))
         self.assertEqual(post.call_count, 2)
+        self.sleep.assert_called_once_with(3)
+
+    def test_429_con_attesa_troppo_lunga_rinuncia(self):
+        with patch("notify.requests.post", return_value=self.troppe(300)) as post:
+            self.assertFalse(nt.invia("messaggio"))
+        self.assertEqual(post.call_count, 1)
+        self.sleep.assert_not_called()
+
+    def test_429_continui_si_fermano_dopo_i_tentativi(self):
+        with patch("notify.requests.post", return_value=self.troppe(1)) as post:
+            self.assertFalse(nt.invia("messaggio"))
+        self.assertEqual(post.call_count, nt.TENTATIVI_INVIO)
+
+    def test_errore_di_rete_restituisce_false(self):
+        with patch("notify.requests.post", side_effect=Exception("rete assente")):
+            self.assertFalse(nt.invia("messaggio"))
+
+
+class TestMain(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self._tmp, True)
+        self.percorso = Path(self._tmp) / "sent_items.json"
+        for p in (patch.object(nt, "STATO", self.percorso),
+                  patch.object(nt, "SCRAPERAPI_KEY", None),
+                  patch.object(nt, "INVIA_AL_PRIMO_GIRO", True)):
+            p.start()
+            self.addCleanup(p.stop)
+        s = patch("notify.time.sleep")
+        self.sleep = s.start()
+        self.addCleanup(s.stop)
+
+    def esegui(self, html_pagina, esiti_invio=None):
+        """Esegue main() con la pagina data. esiti_invio: lista di True/False per ogni invio."""
+        with patch("notify.requests.get", return_value=risposta(html_pagina)), \
+             patch("notify.invia", side_effect=esiti_invio if esiti_invio is not None
+                   else (lambda testo: True)) as invia:
+            nt.main()
+        return invia
+
+    def stato(self):
+        return json.loads(self.percorso.read_text())
+
+    def visti(self):
+        return self.stato()[nt.NOME_FONTE]["visti"]
+
+    def test_primo_giro_invia_le_notizie_recenti_dalla_piu_vecchia(self):
+        pag = pagina(scheda("c", "Terza", formato_sito(1)), scheda("b", "Seconda", formato_sito(5)),
+                     scheda("a", "Prima", formato_sito(10)))
+        invia = self.esegui(pag)
+        testi = [c.args[0] for c in invia.call_args_list]
+        self.assertEqual(len(testi), 3)
+        self.assertIn("Prima", testi[0])
+        self.assertIn("Terza", testi[2])
+        self.assertEqual(len(self.visti()), 3)
+
+    def test_primo_giro_ignora_le_notizie_oltre_il_limite(self):
+        pag = pagina(scheda("n", "Recente", formato_sito(2)),
+                     scheda("v", "Vecchissima", formato_sito(nt.GIORNI_MASSIMI + 20)))
+        invia = self.esegui(pag)
+        self.assertEqual(invia.call_count, 1)
+        self.assertIn("Recente", invia.call_args.args[0])
+        # la vecchia viene segnata come vista: non verrà mai più valutata
+        self.assertIn(f"{SITO}/novita/v/", self.visti())
+
+    def test_primo_giro_silenzioso_se_configurato(self):
+        pag = pagina(scheda("a", "Recente", formato_sito(1)))
+        with patch.object(nt, "INVIA_AL_PRIMO_GIRO", False):
+            invia = self.esegui(pag)
+        invia.assert_not_called()
+        self.assertIn(f"{SITO}/novita/a/", self.visti())
+
+    def test_secondo_giro_non_reinvia(self):
+        pag = pagina(scheda("a", "Recente", formato_sito(1)))
+        self.esegui(pag)
+        invia = self.esegui(pag)
+        invia.assert_not_called()
+
+    def test_notizia_nuova_dopo_il_primo_giro_viene_inviata(self):
+        self.esegui(pagina(scheda("a", "Vecchia", formato_sito(3))))
+        invia = self.esegui(pagina(scheda("b", "Nuova", formato_sito(0)),
+                                   scheda("a", "Vecchia", formato_sito(3))))
+        invia.assert_called_once()
+        testo = invia.call_args.args[0]
+        self.assertIn("Nuova", testo)
+        self.assertIn(f'<a href="{SITO}/novita/b/">', testo)
+        self.assertLess(testo.index("Nuova"), testo.index(f"{SITO}/novita/b/"))
+
+    def test_notizia_senza_data_viene_inviata(self):
+        invia = self.esegui(pagina(scheda("x", "Senza data", data=None)))
+        invia.assert_called_once()
+        self.assertNotIn("📅", invia.call_args.args[0])
+
+    def test_invio_fallito_non_segna_la_notizia_e_si_ferma(self):
+        pag = pagina(scheda("c", "Terza", formato_sito(1)), scheda("b", "Seconda", formato_sito(2)),
+                     scheda("a", "Prima", formato_sito(3)))
+        invia = self.esegui(pag, esiti_invio=[True, False])
+        self.assertEqual(invia.call_count, 2)
+        self.assertEqual(self.visti(), [f"{SITO}/novita/a/"])     # solo la prima è partita
+
+    def test_notizia_fallita_viene_ritentata_alla_corsa_dopo(self):
+        pag = pagina(scheda("a", "Unica", formato_sito(1)))
+        self.esegui(pag, esiti_invio=[False])
+        invia = self.esegui(pag)
+        invia.assert_called_once()
+        self.assertEqual(self.visti(), [f"{SITO}/novita/a/"])
+
+    def test_pause_tra_i_messaggi_ma_non_prima_del_primo(self):
+        pag = pagina(scheda("c", "C", formato_sito(1)), scheda("b", "B", formato_sito(2)),
+                     scheda("a", "A", formato_sito(3)))
+        self.esegui(pag)
+        self.assertEqual(self.sleep.call_count, 2)
+        self.sleep.assert_called_with(nt.PAUSA_TRA_MESSAGGI)
+
+    def test_le_altre_chiavi_dello_stato_vengono_conservate(self):
+        self.percorso.write_text(json.dumps({"feed_ravanusa": ["https://x/?p=1", "https://x/?p=2"]}))
+        self.esegui(pagina(scheda("a", "Nuova", formato_sito(1))))
+        stato = self.stato()
+        self.assertEqual(stato["feed_ravanusa"], ["https://x/?p=1", "https://x/?p=2"])
+        self.assertEqual(stato[nt.NOME_FONTE]["visti"], [f"{SITO}/novita/a/"])
+
+    def test_errore_di_lettura_non_blocca_il_salvataggio_dello_stato(self):
+        self.percorso.write_text(json.dumps({"altro": [1]}))
+        with patch("notify.requests.get", side_effect=Exception("errore di rete simulato")), \
+             patch("notify.invia") as invia:
+            nt.main()          # non deve sollevare eccezioni
+        invia.assert_not_called()
+        self.assertEqual(self.stato(), {"altro": [1]})
+
+    def test_pagina_senza_notizie_non_cambia_lo_stato(self):
+        self.esegui(pagina(scheda("a", "Recente", formato_sito(1))))
+        prima = self.stato()
+        invia = self.esegui("<html>layout cambiato</html>")
+        invia.assert_not_called()
+        self.assertEqual(self.stato(), prima)
+
+    def test_stato_corrotto_viene_trattato_come_primo_avvio(self):
+        self.percorso.write_text("non è json")
+        invia = self.esegui(pagina(scheda("a", "Recente", formato_sito(1))))
+        invia.assert_called_once()
+
+    def test_pagina_che_non_riconosce_nulla_all_avvio_non_crea_la_chiave(self):
+        self.esegui("<html>niente</html>")
+        self.assertNotIn(nt.NOME_FONTE, self.stato())
 
 
 if __name__ == "__main__":
