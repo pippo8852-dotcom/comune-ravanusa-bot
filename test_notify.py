@@ -134,6 +134,196 @@ class FetchNovitaConFeedReale(unittest.TestCase):
             self.assertNotIn("&amp;", item["title"])
 
 
+RSS_NOVITA = """<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0"><channel><title>Novità</title>
+<item>
+    <title>Iscrizione refezione scolastica</title>
+    <link>https://www.comune.ravanusa.ag.it/novita/iscrizione-refezione/</link>
+    <pubDate>Thu, 08 Oct 2026 08:00:00 +0000</pubDate>
+    <category><![CDATA[Avvisi]]></category>
+    <guid isPermaLink="false">https://www.comune.ravanusa.ag.it/?post_type=novita&amp;p=5701</guid>
+</item>
+<item>
+    <title>Albo presidenti di seggio</title>
+    <link>https://www.comune.ravanusa.ag.it/novita/albo-presidenti-seggio/</link>
+    <pubDate>Tue, 06 Oct 2026 08:00:00 +0000</pubDate>
+    <category><![CDATA[Avvisi]]></category>
+    <guid isPermaLink="false">https://www.comune.ravanusa.ag.it/?post_type=novita&amp;p=5698</guid>
+</item>
+<item>
+    <title>Pagina di servizio (non è una novità)</title>
+    <link>https://www.comune.ravanusa.ag.it/servizio/trasporto-scolastico/</link>
+    <pubDate>Mon, 05 Oct 2026 08:00:00 +0000</pubDate>
+    <guid isPermaLink="false">https://www.comune.ravanusa.ag.it/?p=5600</guid>
+</item>
+</channel></rss>"""
+
+TIPI_JSON = {
+    "post": {"slug": "post", "rest_base": "posts"},
+    "page": {"slug": "page", "rest_base": "pages"},
+    "attachment": {"slug": "attachment", "rest_base": "media"},
+    "wp_block": {"slug": "wp_block", "rest_base": "blocks"},
+    "notizia": {"slug": "notizia", "rest_base": "notizie"},
+    "servizio": {"slug": "servizio", "rest_base": "servizi"},
+}
+
+
+def voce_rest(numero, giorno, link_sezione="novita"):
+    return {"id": numero, "link": f"https://www.comune.ravanusa.ag.it/{link_sezione}/voce-{numero}/",
+            "title": {"rendered": f"Voce {numero}"}, "date_gmt": f"2026-10-{giorno:02d}T08:00:00"}
+
+
+class FetchSezioneNovitaTests(unittest.TestCase):
+    def setUp(self):
+        patcher = mock.patch("notify.time.sleep")
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def fetch(self, risposte):
+        with mock.patch("notify.requests.get", side_effect=risposte) as get:
+            items = notify.fetch_novita_sezione()
+        return items, get
+
+    def test_legge_il_feed_della_sezione_novita(self):
+        items, get = self.fetch([make_response(200, RSS_NOVITA)])
+        self.assertEqual(get.call_args_list[0].args[0],
+                         "https://www.comune.ravanusa.ag.it/novita/feed/")
+        self.assertEqual([i["title"] for i in items],
+                         ["Iscrizione refezione scolastica", "Albo presidenti di seggio"])
+
+    def test_l_id_e_il_link_della_notizia(self):
+        items, _ = self.fetch([make_response(200, RSS_NOVITA)])
+        self.assertEqual(items[0]["id"],
+                         "https://www.comune.ravanusa.ag.it/novita/iscrizione-refezione/")
+
+    def test_le_voci_fuori_dalla_sezione_novita_sono_scartate(self):
+        items, _ = self.fetch([make_response(200, RSS_NOVITA)])
+        self.assertTrue(all("/novita/" in i["link"] for i in items))
+        self.assertEqual(len(items), 2)
+
+    def test_data_e_categoria_restano_disponibili(self):
+        items, _ = self.fetch([make_response(200, RSS_NOVITA)])
+        self.assertEqual(items[0]["date"], "08/10/2026 10:00")   # 08:00 UTC = 10:00 ora legale
+        self.assertEqual(items[0]["subject"], "Avvisi")
+
+    def test_se_il_feed_fallisce_cerca_nell_api(self):
+        risposte = [make_response(404, ""), make_response(404, ""),
+                    make_response(200, TIPI_JSON, is_json=True),
+                    make_response(200, [voce_rest(7, 8), voce_rest(6, 2)], is_json=True),
+                    make_response(200, [voce_rest(9, 3, link_sezione="servizio")], is_json=True)]
+        items, get = self.fetch(risposte)
+        self.assertEqual([i["id"] for i in items],
+                         ["https://www.comune.ravanusa.ag.it/novita/voce-7/",
+                          "https://www.comune.ravanusa.ag.it/novita/voce-6/"])
+
+    def test_l_api_interroga_solo_i_tipi_personalizzati(self):
+        risposte = [make_response(404, ""), make_response(404, ""),
+                    make_response(200, TIPI_JSON, is_json=True),
+                    make_response(200, [], is_json=True), make_response(200, [], is_json=True)]
+        _, get = self.fetch(risposte)
+        urls = [c.args[0] for c in get.call_args_list]
+        self.assertTrue(any("/wp/v2/notizie?" in u for u in urls))
+        self.assertTrue(any("/wp/v2/servizi?" in u for u in urls))
+        for standard in ("/wp/v2/posts", "/wp/v2/pages", "/wp/v2/media", "/wp/v2/blocks"):
+            self.assertFalse(any(standard in u for u in urls), standard)
+
+    def test_api_ordina_dal_piu_recente(self):
+        risposte = [make_response(404, ""), make_response(404, ""),
+                    make_response(200, {"a": {"slug": "a", "rest_base": "a"},
+                                        "b": {"slug": "b", "rest_base": "b"}}, is_json=True),
+                    make_response(200, [voce_rest(1, 2)], is_json=True),
+                    make_response(200, [voce_rest(2, 9)], is_json=True)]
+        items, _ = self.fetch(risposte)
+        self.assertEqual([i["title"] for i in items], ["Voce 2", "Voce 1"])
+
+    def test_feed_senza_voci_novita_passa_all_api(self):
+        senza_novita = RSS_NOVITA.replace("/novita/", "/altro/")
+        risposte = [make_response(200, senza_novita),
+                    make_response(200, TIPI_JSON, is_json=True),
+                    make_response(200, [voce_rest(7, 8)], is_json=True),
+                    make_response(200, [], is_json=True)]
+        items, _ = self.fetch(risposte)
+        self.assertEqual([i["title"] for i in items], ["Voce 7"])
+
+    def test_tutto_irraggiungibile_restituisce_lista_vuota(self):
+        with mock.patch("notify.requests.get", return_value=make_response(503, "")):
+            self.assertEqual(notify.fetch_novita_sezione(), [])
+
+    def test_api_con_risposta_inattesa_restituisce_lista_vuota(self):
+        risposte = [make_response(404, ""), make_response(404, ""),
+                    make_response(200, ["non", "un", "dizionario"], is_json=True),
+                    make_response(200, ["non", "un", "dizionario"], is_json=True)]
+        items, _ = self.fetch(risposte)
+        self.assertEqual(items, [])
+
+
+class SezioneNovitaInSourcesTests(unittest.TestCase):
+    def setUp(self):
+        self.src = next(s for s in notify.SOURCES if s["key"] == "novita_ravanusa")
+        patcher = mock.patch("notify.time.sleep")
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    @staticmethod
+    def giorni_fa(n):
+        from datetime import datetime, timedelta
+        return (datetime.now() - timedelta(days=n)).strftime("%d/%m/%Y %H:%M")
+
+    def item(self, n, data):
+        return {"id": f"https://esempio/novita/{n}/", "title": f"Notizia {n}",
+                "link": f"https://esempio/novita/{n}/", "date": data, "subject": None}
+
+    def test_la_sezione_e_attiva_e_ha_un_limite_di_eta(self):
+        self.assertTrue(self.src["enabled"])
+        self.assertEqual(self.src["max_age_days"], 60)
+
+    def test_la_fonte_precedente_resta_la_prima(self):
+        self.assertEqual(notify.SOURCES[0]["key"], "feed_ravanusa")
+
+    def test_notizie_troppo_vecchie_non_vengono_inviate_ne_salvate(self):
+        state = {}
+        items = [self.item(2, self.giorni_fa(1)), self.item(1, self.giorni_fa(120))]
+        with mock.patch.dict(self.src, {"fetch": lambda: items}), \
+             mock.patch("notify.send_telegram_message", return_value=True) as send:
+            notify.process_source(state, self.src)
+        self.assertEqual(send.call_count, 1)
+        self.assertIn("Notizia 2", send.call_args.args[0])
+        self.assertEqual(state["novita_ravanusa"], ["https://esempio/novita/2/"])
+
+    def test_notizia_al_limite_di_eta_viene_inviata(self):
+        state = {}
+        with mock.patch.dict(self.src, {"fetch": lambda: [self.item(1, self.giorni_fa(59))]}), \
+             mock.patch("notify.send_telegram_message", return_value=True) as send:
+            notify.process_source(state, self.src)
+        send.assert_called_once()
+
+    def test_notizia_senza_data_viene_inviata(self):
+        state = {}
+        with mock.patch.dict(self.src, {"fetch": lambda: [self.item(1, None)]}), \
+             mock.patch("notify.send_telegram_message", return_value=True) as send:
+            notify.process_source(state, self.src)
+        send.assert_called_once()
+
+    def test_la_fonte_senza_limite_di_eta_invia_anche_le_vecchie(self):
+        # la fonte del feed principale non ha max_age_days: comportamento invariato
+        vecchia = next(s for s in notify.SOURCES if s["key"] == "feed_ravanusa")
+        state = {}
+        with mock.patch.dict(vecchia, {"fetch": lambda: [self.item(1, self.giorni_fa(400))]}), \
+             mock.patch("notify.send_telegram_message", return_value=True) as send:
+            notify.process_source(state, vecchia)
+        send.assert_called_once()
+
+    def test_messaggio_con_etichetta_notizie_e_data(self):
+        state = {}
+        with mock.patch.dict(self.src, {"fetch": lambda: [self.item(1, self.giorni_fa(1))]}), \
+             mock.patch("notify.send_telegram_message", return_value=True) as send:
+            notify.process_source(state, self.src)
+        msg = send.call_args.args[0]
+        self.assertIn("Novità Comune di Ravanusa", msg)
+        self.assertIn("Leggi la notizia</a>", msg)
+        self.assertIn("🗓", msg)
+
+
 class ProcessSourceTests(unittest.TestCase):
     def setUp(self):
         self._tmp = os.path.join(os.path.dirname(__file__), "_tmp_test_state")
