@@ -216,6 +216,95 @@ class TestLettura(unittest.TestCase):
         self.assertTrue(any("Nessuna notizia riconosciuta" in str(c.args[0]) for c in stampa.call_args_list))
 
 
+def articolo(titolo, data="08 Ottobre 2026"):
+    """Pagina di una singola notizia, con la struttura vista sul sito."""
+    return (f'<html><body><h1 data-audio>{titolo}</h1><div class="row"><div class="col-6">'
+            f'<small>Data:</small>\n<p class="fw-semibold font-monospace">\n   {data}   \n</p></div></div>'
+            f'</body></html>')
+
+
+def sitemap(*slug):
+    locs = "".join(f"<url><loc>{SITO}/novita/{s}/</loc></url>" for s in slug)
+    return f'<?xml version="1.0"?><urlset>{locs}</urlset>'
+
+
+class TestSitemap(unittest.TestCase):
+    def setUp(self):
+        s = patch("notify.time.sleep")
+        s.start()
+        self.addCleanup(s.stop)
+        p = patch.object(nt, "SCRAPERAPI_KEY", None)
+        p.start()
+        self.addCleanup(p.stop)
+
+    def test_articolo_titolo_e_data(self):
+        with patch("notify.requests.get", return_value=risposta(articolo("Refezione &amp; mensa"))):
+            v = nt.leggi_articolo(f"{SITO}/novita/x/")
+        self.assertEqual(v, (f"{SITO}/novita/x/", "Refezione & mensa", date(2026, 10, 8), None))
+
+    def test_articolo_senza_data_o_senza_titolo(self):
+        with patch("notify.requests.get", return_value=risposta("<html><h1>Solo titolo</h1></html>")):
+            self.assertIsNone(nt.leggi_articolo(f"{SITO}/novita/x/")[2])
+        with patch("notify.requests.get", return_value=risposta("<html>niente</html>")):
+            self.assertIsNone(nt.leggi_articolo(f"{SITO}/novita/x/"))
+
+    def test_articolo_errore_http(self):
+        with patch("notify.requests.get", return_value=risposta("", status=500)):
+            self.assertIsNone(nt.leggi_articolo(f"{SITO}/novita/x/"))
+
+    def test_sitemap_legge_solo_le_ultime_e_solo_le_non_viste(self):
+        pagine = {nt.SITEMAP_URL: sitemap(*[f"n{i}" for i in range(100)])}
+        letti = []
+
+        def finto_get(url, **kw):
+            letti.append(url)
+            return risposta(pagine.get(url) or articolo("T"))
+
+        visti = {f"{SITO}/novita/n99/"}
+        with patch("notify.requests.get", side_effect=finto_get):
+            voci = nt.leggi_sitemap(visti)
+        self.assertEqual(len(voci), nt.ULTIME_DA_SITEMAP - 1)
+        self.assertNotIn(f"{SITO}/novita/n99/", letti)
+        self.assertNotIn(f"{SITO}/novita/n0/", letti)
+        self.assertIn(f"{SITO}/novita/n98/", letti)
+
+    def test_sitemap_non_disponibile(self):
+        with patch("notify.requests.get", return_value=risposta("", status=404)):
+            self.assertEqual(nt.leggi_sitemap(), [])
+
+    def test_leggi_ripiega_sulla_sitemap_se_la_pagina_non_funziona(self):
+        def finto_get(url, **kw):
+            if url == nt.URL:
+                return risposta("<html>layout nuovo</html>")
+            if url == nt.SITEMAP_URL:
+                return risposta(sitemap("a", "b"))
+            return risposta(articolo("Notizia"))
+        with patch("notify.requests.get", side_effect=finto_get):
+            voci = nt.leggi()
+        self.assertEqual([v[0] for v in voci], [f"{SITO}/novita/a/", f"{SITO}/novita/b/"])
+
+    def test_leggi_ripiega_sulla_sitemap_se_la_pagina_da_errore(self):
+        def finto_get(url, **kw):
+            if url == nt.URL:
+                return risposta("", status=403)
+            if url == nt.SITEMAP_URL:
+                return risposta(sitemap("a"))
+            return risposta(articolo("Notizia"))
+        with patch("notify.requests.get", side_effect=finto_get):
+            self.assertEqual(len(nt.leggi()), 1)
+
+    def test_se_tutto_fallisce_l_errore_originale_si_propaga(self):
+        with patch("notify.requests.get", return_value=risposta("", status=503)):
+            with self.assertRaises(Exception):
+                nt.leggi()
+
+    def test_sitemap_con_scraperapi(self):
+        with patch.object(nt, "SCRAPERAPI_KEY", "k"), \
+             patch("notify.requests.get", return_value=risposta(sitemap())) as get:
+            nt.leggi_sitemap()
+        self.assertEqual(get.call_args.kwargs["params"]["url"], nt.SITEMAP_URL)
+
+
 class TestFormatoMessaggio(unittest.TestCase):
     def test_struttura_del_messaggio(self):
         testo = nt.formatta_messaggio("Titolo di prova", date(2026, 10, 8),
