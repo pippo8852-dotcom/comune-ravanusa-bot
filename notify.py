@@ -248,12 +248,99 @@ def fetch_novita():
     return []
 
 
+# --- Sezione "Novità" del sito -------------------------------------------------------------
+# Il feed principale (/feed/) contiene solo gli articoli "classici" e si ferma a novembre 2025,
+# mentre le notizie più recenti stanno nella sezione /novita/ (un tipo di contenuto a parte).
+NOVITA_PREFIX = f"{SITE_URL}/novita/"
+NOVITA_FEED_URL = f"{NOVITA_PREFIX}feed/"
+REST_BASE = f"{SITE_URL}/wp-json/wp/v2"
+# Tipi di contenuto standard di WordPress: non sono la sezione Novità
+TIPI_STANDARD = {"post", "page", "attachment", "nav_menu_item", "wp_block", "wp_template",
+                 "wp_template_part", "wp_navigation", "wp_font_family", "wp_font_face",
+                 "wp_global_styles"}
+
+
+def _solo_novita(items):
+    """Tiene solo le voci della sezione Novità e usa il link come ID: è uguale sia che la
+    notizia arrivi dal feed sia che arrivi dall'API, quindi non si creano duplicati."""
+    risultato = {}
+    for item in items:
+        if item["link"].startswith(NOVITA_PREFIX):
+            risultato.setdefault(item["link"], dict(item, id=item["link"]))
+    return list(risultato.values())
+
+
+def _parse_novita_feed(resp):
+    return _solo_novita(_parse_feed_xml(resp))
+
+
+def _parse_novita_rest(resp):
+    return _solo_novita(_parse_wp_posts(resp))
+
+
+def _parse_tipi_di_contenuto(resp):
+    """Percorsi REST dei tipi di contenuto personalizzati (tutti tranne quelli standard)."""
+    tipi = resp.json()
+    if not isinstance(tipi, dict):
+        raise ValueError(f"risposta API inattesa: {str(tipi)[:100]}")
+    return [info.get("rest_base") or slug for slug, info in tipi.items()
+            if slug not in TIPI_STANDARD and isinstance(info, dict)]
+
+
+def _data_di(item):
+    try:
+        return datetime.strptime(item.get("date"), "%d/%m/%Y %H:%M")
+    except (TypeError, ValueError):
+        return None
+
+
+def _fetch_novita_rest():
+    """Cerca da sola il tipo di contenuto che ospita le Novità: elenca i tipi personalizzati,
+    legge le ultime voci di ciascuno e tiene quelle con link /novita/."""
+    percorsi = _fetch_with_retries(f"{REST_BASE}/types", _parse_tipi_di_contenuto)
+    if percorsi is None:
+        return None
+    print(f"🔎 Tipi di contenuto personalizzati trovati: {percorsi}")
+    trovate = {}
+    for percorso in percorsi:
+        url = f"{REST_BASE}/{percorso}?per_page=10&_fields=id,link,title,date_gmt"
+        for item in _fetch_with_retries(url, _parse_novita_rest) or []:
+            trovate.setdefault(item["id"], item)
+    return sorted(trovate.values(), key=lambda i: _data_di(i) or datetime.min, reverse=True)
+
+
+def fetch_novita_sezione():
+    """Notizie della sezione Novità: prima il feed della sezione, poi l'API di WordPress."""
+    items = _fetch_with_retries(NOVITA_FEED_URL, _parse_novita_feed)
+    if items:
+        return items
+    print("ℹ️ Feed della sezione Novità non disponibile o vuoto: provo con l'API di WordPress.")
+    return _fetch_novita_rest() or []
+
+
+def _piu_vecchia_di(item, giorni):
+    """True se la notizia ha una data e risale a più di `giorni` giorni fa."""
+    data = _data_di(item)
+    if data is None:
+        return False
+    try:
+        adesso = datetime.now(ZoneInfo(LOCAL_TZ_NAME)).replace(tzinfo=None)
+    except Exception:
+        adesso = datetime.now()
+    return (adesso - data).days > giorni
+
+
 # Ogni fonte ha: chiave nello stato, etichetta del messaggio, funzione di lettura
 # e "enabled" (se False la fonte viene saltata del tutto: nessuna richiesta, nessun invio).
 SOURCES = [
     {"key": "feed_ravanusa", "label": "📰 Novità Comune di Ravanusa",
      "link_label": "🔗 Leggi la notizia",
      "fetch": lambda: fetch_novita(), "enabled": True},
+    # Sezione Novità del sito (notizie recenti). max_age_days: ignora le notizie più vecchie di così,
+    # per evitare di rimandare notizie vecchie se una fonte restituisse un elenco non aggiornato.
+    {"key": "novita_ravanusa", "label": "📰 Novità Comune di Ravanusa",
+     "link_label": "🔗 Leggi la notizia",
+     "fetch": lambda: fetch_novita_sezione(), "enabled": True, "max_age_days": 60},
 ]
 
 
@@ -264,6 +351,12 @@ def process_source(state, source):
     items = source["fetch"]()
 
     new_items = [item for item in items if item["id"] not in known_ids]
+    max_age = source.get("max_age_days")
+    if max_age:
+        recenti = [item for item in new_items if not _piu_vecchia_di(item, max_age)]
+        if len(recenti) < len(new_items):
+            print(f"🕓 Ignorate {len(new_items) - len(recenti)} notizie più vecchie di {max_age} giorni.")
+        new_items = recenti
     print(f"📊 Summary [{source['label']}]: Letti {len(items)} | Nuovi da inviare {len(new_items)}")
     print(f"🗓 Date trovate: {sum(1 for i in items if i.get('date'))} su {len(items)}")
 
