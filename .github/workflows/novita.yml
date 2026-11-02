@@ -1,7 +1,7 @@
 name: Controlla novità Comune di Ravanusa
 on:
   schedule:
-    - cron: "0 16 * * 1-5"   # ore 17:00 italiane (ora solare, UTC+1), lun-ven
+    - cron: "15 16 * * 1-5"   # ore 17:00 italiane (ora solare, UTC+1), lun-ven
   workflow_dispatch:          # avvio manuale
 permissions:
   contents: write
